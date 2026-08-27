@@ -3,18 +3,17 @@ import math
 import argparse
 import sys
 import os
+import datetime
 
-def parse_csv(filepath):
-	"""
-	讀取並解析 CtrlCode.csv，轉換為 1-bit 二進位位元流 (Bitstream)
-	"""
+def parse_csv(csv_path):
+	"""讀取並解析 CtrlCode.csv，回傳 1-bit 序列資料流與總位元數"""
 	bitstream = []
 	
-	if not os.path.exists(filepath):
-		raise FileNotFoundError(f"找不到指定的輸入檔案: {filepath}")
+	if not os.path.exists(csv_path):
+		raise FileNotFoundError(f"找不到指定的輸入檔案: {csv_path}")
 
 	# 使用 utf-8-sig 自動處理可能帶有 BOM 的 CSV 檔案
-	with open(filepath, mode='r', encoding='utf-8-sig') as f:
+	with open(csv_path, mode='r', encoding='utf-8-sig') as f:
 		reader = csv.DictReader(f)
 		
 		# 驗證 CSV 標頭是否正確
@@ -49,167 +48,222 @@ def parse_csv(filepath):
 
 			bitstream.extend(bits)
 
-	return bitstream
+	return bitstream, len(bitstream)
+	
 
-def generate_pgv(bitstream, output_file, enable_reset=False, enable_write=False, enable_read=False):
-	"""
-	依據 Acute Pattern Generator No Time Stamp 格式規範產生 .pgv 檔案
-	"""
+def format_row(addr_index, pg_func=0x000, data=0, clk_m=0, clk_s=0, addr=0, scan_in=0, en_scan_in=0, rst_ckt=0, rst_cnt=0, en_scan_out=0):
+	"""將參數格式化為固定寬度並對齊，行尾附上從 0 開始的十六進位位址註解"""
+	part1 = f"{pg_func:03X}h"
+	part2 = f"{clk_m} {clk_s} {addr:>4} {scan_in} {en_scan_in} {rst_ckt} {rst_cnt} {en_scan_out}"
+	
+	# 利用固定寬度讓文字對齊，並確保每行附加上對齊的 16 進位行號註解
+	line = f"{part1:<6} {part2:<18}"
+	return f"{line:<24} // {addr_index:04X}h"
+
+def write_headers(f, total_bits, addr_index):
+	"""寫入 No Time Stamp 模式的標頭與腳位映射 (ASSIGN)"""
+	N = 0 if total_bits <= 1 else math.ceil(math.log2(total_bits)) - 1
+	f.write(f"INPUTS PG_Function CLK_M CLK_S addr scan_in EN_SCAN_IN RST_CKT RST_CNT EN_SCAN_OUT;\n")
+	f.write(f"ASSIGN addr 0..{N};\n")
+	f.write(f"ASSIGN CLK_M {N+1};\n")
+	f.write(f"ASSIGN CLK_S {N+2};\n")
+	f.write(f"ASSIGN scan_in {N+3};\n")
+	f.write(f"ASSIGN EN_SCAN_IN {N+4};\n")
+	f.write(f"ASSIGN RST_CKT {N+5};\n")
+	f.write(f"ASSIGN RST_CNT {N+6};\n")
+	f.write(f"ASSIGN EN_SCAN_OUT {N+7};\n")
+	f.write("RADIX AUTO;\n")
+	f.write("FREQUENCYMODE INTERNAL;\n")
+	f.write("FREQUENCY 1 MHz;\n")
+	f.write("PATTERN\n")
+
+	for _ in range(10):
+		f.write(format_row(addr_index) + '\n')
+		addr_index += 1
+	
+	f.write(format_row(addr_index, pg_func=0x8FF) + ' (MOV RL, 255)\n')
+	addr_index += 1
+	f.write(format_row(addr_index, pg_func=0x2FF) + ' (MOV RH, 255)\n')
+	addr_index += 1
+	f.write(format_row(addr_index, pg_func=0x900) + ' OE 65535     \n')
+	addr_index += 1
+
+	return addr_index
+
+def do_reset(f, addr_index):
+	"""RESET 階段：持續 20us (20 列)"""
+	for _ in range(10):
+		f.write(format_row(addr_index) + '\n')
+		addr_index += 1
+	for _ in range(20):
+		f.write(format_row(addr_index, rst_ckt=1, rst_cnt=1) + '\n')
+		addr_index += 1
+	for _ in range(10):
+		f.write(format_row(addr_index) + '\n')
+		addr_index += 1
+	
+	return addr_index
+
+def do_write(f, addr_index, bitstream):
+	"""WRITE 階段：將 bitstream 寫入目標晶片"""
 	total_bits = len(bitstream)
-	if total_bits == 0:
-		raise ValueError("轉換後的 Bitstream 為空，無有效資料可生成波形。請檢查 CSV 內容。")
+	for bit_idx in range(total_bits):
+		scan_val = bitstream[bit_idx]
+		# 每個 bit 傳輸週期為 10us (10 列)
+		for row in range(10):
+			clk_m = 1 if 3 <= row <= 6 else 0
+			if bit_idx == 0:
+				clk_s = 1 if row in (8, 9) else 0
+			else:
+				clk_s = 1 if row in (0, 1, 8, 9) else 0
+			f.write(format_row(
+				addr_index, 
+				clk_m=clk_m, 
+				clk_s=clk_s, 
+				addr=bit_idx, 
+				scan_in=scan_val,
+				en_scan_in=1
+			) + '\n')
+			addr_index += 1
 
-	with open(output_file, mode='w', encoding='utf-8') as f:
+	f.write(format_row(addr_index, clk_m=0, clk_s=1, en_scan_in=1) + '\n')
+	addr_index += 1
+	f.write(format_row(addr_index, clk_m=0, clk_s=1, en_scan_in=1) + '\n')
+	addr_index += 1
+
+	# Latch 鎖存階段：EN_SCAN_IN 拉至 0，並發送一組完整的 CLK
+	for row in range(30):
+		clk_m = 1 if 13 <= row <= 16 else 0
+		clk_s = 1 if 18 <= row <= 21 else 0
+		f.write(format_row(addr_index, clk_m=clk_m, clk_s=clk_s, en_scan_in=0) + ' Load into circuit\n')
+		addr_index += 1
+
+	# reset counter
+	for _ in range(10):
+		f.write(format_row(addr_index, rst_ckt=0, rst_cnt=1) + '\n')
+		addr_index += 1
 		
-		# 1. 宣告輸入腳位 (順序必須與 Pattern 對應)
-		f.write(f"INPUTS PG_Function CLK_M CLK_S addr scan_in EN_SCAN_IN RST_CKT RST_CNT EN_SCAN_OUT;\n")
+	# 收尾：將所有訊號歸零
+	for _ in range(5):
+		f.write(format_row(addr_index) + '\n')
+		addr_index += 1
+	
+	return addr_index
+
+def do_wait(f, addr_index, wait_cycles):
+	"""
+	WAIT 階段：利用 PG 內建 LOOP 功能空轉等待。
+	傳入之 wait_cycles 為目標等待時間，單位為 256 cycles。
+	"""
+	if wait_cycles < 2:
+		print("Warning: PG 暫存器限制 LC 最小值為 2。已自動將等待參數修正為 2。")
+		wait_cycles = 2
+	elif wait_cycles > 65536:
+		print("Warning: PG 暫存器限制 LC 最大值為 65536。已自動將等待參數修正為 65536。")
+		wait_cycles = 65536
+
+	# 1. 寫入 LC 暫存器 (設定迴圈次數)
+	f.write(format_row(addr_index, pg_func=0x800 + (wait_cycles & 0xFF)) + '\n')           # MOV RL, LSB
+	addr_index += 1
+	f.write(format_row(addr_index, pg_func=0x200 + ((wait_cycles >> 8) & 0xFF)) + '\n')    # MOV RH, MSB
+	addr_index += 1
+	f.write(format_row(addr_index, pg_func=0x300) + '\n')                                  # MOV LC, 從 RL/RH 載入
+	addr_index += 1
+	
+	# 紀錄 Loop 的起始位址
+	loop_start_addr = addr_index
+	
+	# 2. 迴圈本體 (單位為 250 cycles，因此迴圈總共要經過 250 列)
+	# 跳轉設定需要占用 3 列 (MOV RL, MOV RH, LP)，因此空轉 IDLE 需 247 列
+	for _ in range(247):
+		f.write(format_row(addr_index) + '\n')
+		addr_index += 1
 		
-		# 2. 腳位通道對應 (ASSIGN)
-		# addr 固定從 Channel 0 開始
-		current_ch = 0
-		f.write(f"ASSIGN addr 0..7;\n")
-		f.write(f"ASSIGN CLK_M 8;\n")
-		f.write(f"ASSIGN CLK_S 9;\n")
-		f.write(f"ASSIGN scan_in 10;\n")
-		f.write(f"ASSIGN EN_SCAN_IN 11;\n")
-		f.write(f"ASSIGN RST_CKT 12;\n")
-		f.write(f"ASSIGN RST_CNT 13;\n")
-		f.write(f"ASSIGN EN_SCAN_OUT 14;\n\n")
-		
-		# 寫入標頭、模式與頻率宣告
-		f.write("RADIX AUTO;\n")
-		f.write("FREQUENCYMODE INTERNAL;\n")
-		f.write("FREQUENCY 1 MHz;\n\n")
+	# 3. 執行 LP 條件跳轉 (跳回 loop_start_addr)
+	f.write(format_row(addr_index, pg_func=0x800 + (loop_start_addr & 0xFF)) + '\n')        # MOV RL
+	addr_index += 1
+	f.write(format_row(addr_index, pg_func=0x200 + ((loop_start_addr >> 8) & 0xFF)) + '\n') # MOV RH
+	addr_index += 1
+	f.write(format_row(addr_index, pg_func=0x400) + '\n')                                   # LP 執行跳轉並將 LC-1
+	addr_index += 1
+	
+	return addr_index
 
-		# 3. 輸出波形資料 (每列代表 1 us)
-		f.write("PATTERN\n")
+def do_read(f, addr_index):
+	"""READ 階段：發送等量時脈週期但不 scan-in，用以將資料移出或驗證"""
 
-		def write_pattern_row(clk_m=0, clk_s=0, addr=0, scan_in=0, en_scan_in=0, rst_ckt=0, rst_cnt=0, en_scan_out=0):
-			# PG_Function 欄位固定輸出 000h
-			f.write(f"000h {clk_m} {clk_s} {addr:4d} {scan_in} {en_scan_in} {rst_ckt} {rst_cnt} {en_scan_out}\n")
-		
-		def write_pattern_row_idle(n):
-			for _ in range(n):
-				f.write(f"000h 0 0 {0:4d} 0 0 0 0 0 // Idle\n")
+	for j in range(20):
+		clk_m_val = 1 if 3 <= j <=  6 else 0
+		clk_s_val = 1 if 8 <= j <= 11 else 0
+		f.write(format_row(addr_index, clk_m=clk_m_val, clk_s=clk_s_val) + '\n')
+		addr_index += 1
 
-		# PG function setting ############################################
-		write_pattern_row_idle(15)
-		f.write(f"8FFh 0 0 {0:4d} 0 0 0 0 0 //	(MOV RL, 255)\n")
-		f.write(f"2FFh 0 0 {0:4d} 0 0 0 0 0 // 	(MOV RH, 255)\n")
-		f.write(f"900h 0 0 {0:4d} 0 0 0 0 0 //	OE 65535    \n")
-		write_pattern_row_idle(10)
-		##################################################################
-		
-		# [階段一] Reset 階段
-		if enable_reset:
-			for _ in range(20):
-				write_pattern_row(rst_ckt=1, rst_cnt=1)
-			write_pattern_row_idle(10)
+	for data_idx in range(4):
+		for bit_idx in range(40):
+			for row in range(10):
+				clk_m = 1 if 3 <= row <= 6 else 0
+				if data_idx == 0 and bit_idx == 0:
+					clk_s = 1 if row in (8, 9) else 0
+				else:
+					clk_s = 1 if row in (0, 1, 8, 9) else 0
+				addr = 9 - (bit_idx // 4) 
+				f.write(format_row(addr_index, clk_m=clk_m, clk_s=clk_s, addr=addr, en_scan_out=1) + '\n')
+				addr_index += 1
 
-		# [階段二] Scan-IN 階段 ###########################################
-		if enable_write:
-			for i, bit_val in enumerate(bitstream):
-				# 每個 bit 的週期為 10 us (10 列)
-				for j in range(10):
-					clk_m_val = 1 if 3 <= j <= 6 else 0
-					if i == 0:
-						clk_s_val = 1 if j in (8, 9) else 0
-					else:
-						clk_s_val = 1 if j in (0, 1, 8, 9) else 0
-					
-					write_pattern_row(
-						clk_m=clk_m_val, 
-						clk_s=clk_s_val, 
-						addr=i, 
-						scan_in=bit_val, 
-						en_scan_in=1
-					)
-
-			# 確保最後一個 bit 的 CLK_S Pulse 完整輸出
-			write_pattern_row(clk_m=0, clk_s=1, en_scan_in=1)
-			write_pattern_row(clk_m=0, clk_s=1, en_scan_in=1)
-			write_pattern_row_idle(10)
-
-			# [階段三] 鎖存與結束階段
-			# 發送一組完整的鎖存訊號，並將 EN_SCAN_IN 拉回 0
-			for j in range(30):
-				clk_m_val = 1 if 13 <= j <= 16 else 0
-				clk_s_val = 1 if 18 <= j <= 21 else 0
-				write_pattern_row(
-					clk_m=clk_m_val, 
-					clk_s=clk_s_val
-				)
-
-			# 結束訊號：將 EN_SCAN_IN 拉回 0，完成整體波形輸出
-			write_pattern_row_idle(20)
-
-			for _ in range(20):
-				write_pattern_row(rst_ckt=0, rst_cnt=1)
-			write_pattern_row_idle(10)
-
-		#  Wait for counting #############################################
-		if enable_write and enable_read:
-			# write_pattern_row_idle(54500)
-			write_pattern_row_idle(44724)
-
-		# [階段二] Scan-OUT 階段 ##########################################
-		if enable_read: 
-			for j in range(20):
-				clk_m_val = 1 if 3 <= j <=  6 else 0
-				clk_s_val = 1 if 8 <= j <= 11 else 0
-				write_pattern_row(
-					clk_m=clk_m_val, 
-					clk_s=clk_s_val
-				)
-
-			addr = 9
-			for i in range(4):
-				for j in range(40):
-					for k in range(10):
-						clk_m_val = 1 if 3 <= k <= 6 else 0
-						if i == 0 and j == 0:
-							clk_s_val = 1 if k in (8, 9) else 0
-						else:
-							clk_s_val = 1 if k in (0, 1, 8, 9) else 0
-						if k == 0 and (j % 4) == 0:
-							addr = 9 if j == 0 else addr - 1
-
-						write_pattern_row(
-							clk_m=clk_m_val, 
-							clk_s=clk_s_val, 
-							addr=addr, 
-							en_scan_out=1
-						)
-						
-			write_pattern_row(clk_m=0, clk_s=1, en_scan_out=1)
-			write_pattern_row(clk_m=0, clk_s=1, en_scan_out=1)
-			write_pattern_row_idle(10)
+	f.write(format_row(addr_index, clk_m=0, clk_s=1, en_scan_out=1) + '\n')
+	addr_index += 1
+	f.write(format_row(addr_index, clk_m=0, clk_s=1, en_scan_out=1) + '\n')
+	addr_index += 1
+	
+	# 收尾歸零
+	f.write(format_row(addr_index) + '\n')
+	addr_index += 1
+	return addr_index
 
 def main():
 	parser = argparse.ArgumentParser(description="Acute PGV Vector Generator (自動轉換 CSV 為 PGV)")
-	parser.add_argument('-i', '--input', default='CtrlCode.csv', help="輸入的 CSV 檔案名稱 (預設: CtrlCode.csv)")
-	parser.add_argument('-o', '--output', default='output.pgv', help="輸出的 PGV 檔案名稱 (預設: output.pgv)")
-	parser.add_argument('-R', '--reset', action='store_true', help="啟用一開始的 Reset 階段 (若無此參數則不安插 Reset)")
-	parser.add_argument('-w', '--write', action='store_true', help="啟用寫入資料階段")
-	parser.add_argument('-r', '--read', action='store_true', help="啟用讀出資料階段")
-
+	parser.add_argument('-i', '--input', default='CtrlCode.csv', help="輸入的 CSV 檔案路徑 (預設: CtrlCode.csv)")
+	parser.add_argument('-o', '--output', default='output.pgv', help="輸出的 PGV 檔案路徑 (預設: output.pgv)")
+	
+	# 階段控制指令
+	parser.add_argument('-RST', '--reset', action='store_true', help="包含 RESET 初始階段")
+	parser.add_argument('-W', '--write', action='store_true', help="包含 WRITE 資料掃入階段")
+	parser.add_argument('-t', '--wait', type=int, default=1000, help="設定 WRITE 後的等待時間 (單位: 250 cycles，例如 -t 10000)")
+	parser.add_argument('-R', '--read', action='store_true', help="包含 READ 資料讀出階段")
+	
 	args = parser.parse_args()
 
+	# 讀取 CSV
 	try:
 		print(f"[*] 正在讀取並解析輸入檔案: {args.input} ...")
-		bitstream = parse_csv(args.input)
-		total_bits = len(bitstream)
+		bitstream, total_bits = parse_csv(args.input)
 		print(f"[*] 解析完成。總共提取出 {total_bits} bits 的資料序列。")
 
-		print(f"[*] 正在依據時序規範生成 PGV 波形檔...")
-		generate_pgv(bitstream, args.output, enable_reset=args.reset, enable_write=args.write, enable_read=args.read)
-		
-		print(f"[+] 成功輸出檔案: {args.output}")
-		print("[+] 執行完畢！")
-
 	except Exception as e:
-		print(f"\n[!] 執行失敗: {e}", file=sys.stderr)
+		print(f"[x] 錯誤: {e}, CSV 檔案讀取失敗")
 		sys.exit(1)
 
-if __name__ == '__main__':
+	# 統一先清空目標檔案，再依序將使用者指定的指令寫入
+	with open(args.output, 'w', encoding='utf-8') as f:
+		# 維護一個全域的位址索引
+		addr_index = 0
+
+		addr_index = write_headers(f, total_bits, addr_index)
+		
+		if args.reset:
+			addr_index = do_reset(f, addr_index)
+			
+		if args.write:
+			addr_index = do_write(f, addr_index, bitstream)
+			
+		if args.write and args.read:
+			addr_index = do_wait(f, addr_index, args.wait)
+			
+		if args.read:
+			addr_index = do_read(f, addr_index)
+			
+	print(f"[v] PGV 檔案已成功生成至: {args.output}")
+	print(f"[*] 生成時間: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+if __name__ == "__main__":
 	main()
