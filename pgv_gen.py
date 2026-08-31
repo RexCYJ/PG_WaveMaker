@@ -58,7 +58,7 @@ def format_row(addr_index, pg_func=0x000, data=0, clk_m=0, clk_s=0, addr=0, scan
 	
 	# 利用固定寬度讓文字對齊，並確保每行附加上對齊的 16 進位行號註解
 	line = f"{part1:<6} {part2:<18}"
-	return f"{line:<24} // {addr_index:04X}h"
+	return f"{line:<24} // {addr_index:04X}h {addr_index:04}"
 
 def write_headers(f, total_bits, addr_index):
 	"""寫入 No Time Stamp 模式的標頭與腳位映射 (ASSIGN)"""
@@ -150,41 +150,50 @@ def do_write(f, addr_index, bitstream):
 	
 	return addr_index
 
-def do_wait(f, addr_index, wait_cycles):
+def do_wait(f, addr_index, wait_cycles, unit):
 	"""
 	WAIT 階段：利用 PG 內建 LOOP 功能空轉等待。
 	傳入之 wait_cycles 為目標等待時間，單位為 256 cycles。
 	"""
 	if wait_cycles < 2:
-		print("Warning: PG 暫存器限制 LC 最小值為 2。已自動將等待參數修正為 2。")
+		print("[!] Warning: PG 暫存器限制 LC 最小值為 2。已自動將等待參數修正為 2。")
 		wait_cycles = 2
 	elif wait_cycles > 65536:
-		print("Warning: PG 暫存器限制 LC 最大值為 65536。已自動將等待參數修正為 65536。")
+		print("[!] Warning: PG 暫存器限制 LC 最大值為 65536。已自動將等待參數修正為 65536。")
 		wait_cycles = 65536
 
+	if unit < 4:
+		print("[!] Warning: unit too small, and is reset to 4")
+		unit = 4
+	elif unit > 50000:
+		unit = 50000
+		print("[!] Warning: unit too large, and is reset to 50000")
+
+	print(f"[*] Waiting time: \t{wait_cycles} x {unit} us = {wait_cycles*unit/1000000} s")
+	
 	# 1. 寫入 LC 暫存器 (設定迴圈次數)
-	f.write(format_row(addr_index, pg_func=0x800 + (wait_cycles & 0xFF)) + '\n')           # MOV RL, LSB
+	f.write(format_row(addr_index, pg_func=0x800 + (wait_cycles & 0xFF)) + ' LC: RL \n')           # MOV RL, LSB
 	addr_index += 1
-	f.write(format_row(addr_index, pg_func=0x200 + ((wait_cycles >> 8) & 0xFF)) + '\n')    # MOV RH, MSB
+	f.write(format_row(addr_index, pg_func=0x200 + ((wait_cycles >> 8) & 0xFF)) + ' LC: RH\n')    # MOV RH, MSB
 	addr_index += 1
-	f.write(format_row(addr_index, pg_func=0x300) + '\n')                                  # MOV LC, 從 RL/RH 載入
+	f.write(format_row(addr_index, pg_func=0x400) + f" LC: {wait_cycles} cycles \n")                                  # MOV LC, 從 RL/RH 載入
 	addr_index += 1
 	
 	# 紀錄 Loop 的起始位址
-	loop_start_addr = addr_index
+	loop_start_addr = addr_index + 12
 	
 	# 2. 迴圈本體 (單位為 250 cycles，因此迴圈總共要經過 250 列)
 	# 跳轉設定需要占用 3 列 (MOV RL, MOV RH, LP)，因此空轉 IDLE 需 247 列
-	for _ in range(247):
+	for _ in range(unit - 3):
 		f.write(format_row(addr_index) + '\n')
 		addr_index += 1
 		
 	# 3. 執行 LP 條件跳轉 (跳回 loop_start_addr)
-	f.write(format_row(addr_index, pg_func=0x800 + (loop_start_addr & 0xFF)) + '\n')        # MOV RL
+	f.write(format_row(addr_index, pg_func=0x800 + (loop_start_addr & 0xFF)) + ' LP: RL \n')        # MOV RL
 	addr_index += 1
-	f.write(format_row(addr_index, pg_func=0x200 + ((loop_start_addr >> 8) & 0xFF)) + '\n') # MOV RH
+	f.write(format_row(addr_index, pg_func=0x200 + ((loop_start_addr >> 8) & 0xFF)) + ' LP: RH \n') # MOV RH
 	addr_index += 1
-	f.write(format_row(addr_index, pg_func=0x400) + '\n')                                   # LP 執行跳轉並將 LC-1
+	f.write(format_row(addr_index, pg_func=0x300) + f" LP: {loop_start_addr:04X}h\n")                                   # LP 執行跳轉並將 LC-1
 	addr_index += 1
 	
 	return addr_index
@@ -228,19 +237,20 @@ def main():
 	# 階段控制指令
 	parser.add_argument('-RST', '--reset', action='store_true', help="包含 RESET 初始階段")
 	parser.add_argument('-W', '--write', action='store_true', help="包含 WRITE 資料掃入階段")
-	parser.add_argument('-t', '--wait', type=int, default=1000, help="設定 WRITE 後的等待時間 (單位: 250 cycles，例如 -t 10000)")
 	parser.add_argument('-R', '--read', action='store_true', help="包含 READ 資料讀出階段")
+	parser.add_argument('-t', '--wait', type=int, default=1000, help="設定 WRITE 後的等待時間 (例如 -t 10000/單位 -unit)")
+	parser.add_argument('-u', '--unit', type=int, default=10000, help="設定 WRITE 後的等待時間單位")
 	
 	args = parser.parse_args()
 
 	# 讀取 CSV
 	try:
-		print(f"[*] 正在讀取並解析輸入檔案: {args.input} ...")
+		print(f"[*] Analyzing: \t\t{args.input} ...")
 		bitstream, total_bits = parse_csv(args.input)
-		print(f"[*] 解析完成。總共提取出 {total_bits} bits 的資料序列。")
+		print(f"[*] Finish analyzing: \tobtain {total_bits}-bit sequential data.")
 
 	except Exception as e:
-		print(f"[x] 錯誤: {e}, CSV 檔案讀取失敗")
+		print(f"[x] ERROR: {e}, Fail to interpret CSV file")
 		sys.exit(1)
 
 	# 統一先清空目標檔案，再依序將使用者指定的指令寫入
@@ -257,13 +267,13 @@ def main():
 			addr_index = do_write(f, addr_index, bitstream)
 			
 		if args.write and args.read:
-			addr_index = do_wait(f, addr_index, args.wait)
+			addr_index = do_wait(f, addr_index, args.wait, args.unit)
 			
 		if args.read:
 			addr_index = do_read(f, addr_index)
 			
-	print(f"[v] PGV 檔案已成功生成至: {args.output}")
-	print(f"[*] 生成時間: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+	print(f"[v] PGV file generated: {args.output}")
+	print(f"[*] Job done time: \t{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 if __name__ == "__main__":
 	main()
